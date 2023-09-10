@@ -1,42 +1,15 @@
 #!/usr/bin/env bash
 
+VPN_IF_NAME=Torrent
+QBITTORRENT_SERVER=127.0.0.1
+QBITTORRENT_PORT=8080
+QBITTORRENT_USER=admin
+QBITTORRENT_PASS=admins
+VPN_GATEWAY=10.2.0.1
+NAT_LEASE_LIFETIME=60
+
 timestamp() {
     date '+%Y-%m-%d %H:%M:%S'
-}
-
-get_vpn_if_gw() {
-    local vpn_if_hex_addr=''
-    local vpn_if_dec_addr=''
-    local vpn_if_addr=''
-    local try_ip=''
-    local vpn_if_gw=''
-
-    vpn_if_hex_addr=$(grep "${VPN_IF_NAME}" /proc/net/route | awk '$2 == "00000000" { print $3 }')
-    
-    if [ -n "${vpn_if_hex_addr}" ]; then
-        #shellcheck disable=SC2046
-        vpn_if_dec_addr=$(printf "%d." $(echo "${vpn_if_hex_addr}" | sed 's/../0x& /g' | tr ' ' '\n' | tac) | sed 's/\.$/\n/')
-    fi
-
-    if [ -z "${vpn_if_dec_addr}" ]; then
-        vpn_if_addr=$(ip addr show dev "${VPN_IF_NAME}" | grep -oP '([0-9]{1,3}[\.]){3}[0-9]{1,3}')
-        for n in {1..254}; do
-            try_ip="$(echo "${vpn_if_addr}" | cut -d'.' -f1-3).${n}"
-            if [ "${try_ip}" != "${vpn_if_addr}" ]; then
-                if nc -4 -vw1 "${try_ip}" 1 &>/dev/null 2>&1; then
-                    vpn_if_gw=${try_ip}
-                    break
-                fi
-            fi
-        done
-        if [ -n "${vpn_if_gw}" ]; then
-            echo "${vpn_if_gw}"
-        else
-            return 1
-        fi
-    else 
-        echo "${vpn_if_dec_addr}"
-    fi
 }
 
 getpublicip() {
@@ -50,9 +23,9 @@ findconfiguredport() {
 
 findactiveport() {
     # shellcheck disable=SC2086
-    natpmpc -g ${VPN_GATEWAY} -a 0 0 udp ${NAT_LEASE_LIFETIME} >/dev/null 2>&1
+    natpmpc -a 1 0 udp ${NAT_LEASE_LIFETIME} -g ${VPN_GATEWAY} >/dev/null 2>&1
     # shellcheck disable=SC2086
-    natpmpc -g ${VPN_GATEWAY} -a 0 0 tcp ${NAT_LEASE_LIFETIME} | grep -oP '(?<=Mapped public port.).*(?=.protocol.*)'
+    natpmpc -a 1 0 tcp ${NAT_LEASE_LIFETIME} -g ${VPN_GATEWAY} | grep -oP '(?<=Mapped public port.).*(?=.protocol.*)'
 }
 
 qbt_login() {
@@ -79,20 +52,20 @@ qbt_isreachable(){
 }
 
 fw_delrule(){
-    if (docker exec "${VPN_CT_NAME}" /sbin/iptables -L INPUT -n | grep -qP "^ACCEPT.*${configured_port}.*"); then
+    if (/sbin/iptables -L INPUT -n | grep -qP "^ACCEPT.*${configured_port}.*"); then
         # shellcheck disable=SC2086
-        docker exec "${VPN_CT_NAME}" /sbin/iptables -D INPUT -i "${VPN_IF_NAME}" -p tcp --dport ${configured_port} -j ACCEPT
+       /sbin/iptables -D INPUT -i "${VPN_IF_NAME}" -p tcp --dport ${configured_port} -j ACCEPT
         # shellcheck disable=SC2086
-        docker exec "${VPN_CT_NAME}" /sbin/iptables -D INPUT -i "${VPN_IF_NAME}" -p udp --dport ${configured_port} -j ACCEPT
+       /sbin/iptables -D INPUT -i "${VPN_IF_NAME}" -p udp --dport ${configured_port} -j ACCEPT
     fi
 }
 
 fw_addrule(){
-    if ! (docker exec "${VPN_CT_NAME}" /sbin/iptables -L INPUT -n | grep -qP "^ACCEPT.*${active_port}.*"); then
+    if ! (/sbin/iptables -L INPUT -n | grep -qP "^ACCEPT.*${active_port}.*"); then
         # shellcheck disable=SC2086
-        docker exec "${VPN_CT_NAME}" /sbin/iptables -A INPUT -i "${VPN_IF_NAME}" -p tcp --dport ${active_port} -j ACCEPT
+        /sbin/iptables -A INPUT -i "${VPN_IF_NAME}" -p tcp --dport ${active_port} -j ACCEPT
         # shellcheck disable=SC2086
-        docker exec "${VPN_CT_NAME}" /sbin/iptables -A INPUT -i "${VPN_IF_NAME}" -p udp --dport ${active_port} -j ACCEPT
+        /sbin/iptables -A INPUT -i "${VPN_IF_NAME}" -p udp --dport ${active_port} -j ACCEPT
         return 0
     else
         return 1
@@ -124,7 +97,7 @@ get_portmap() {
     if [ ${configured_port} != ${active_port} ]; then
         if qbt_changeport "${qbt_sid}" ${active_port}; then
             if fw_delrule; then
-                echo "$(timestamp) | IPTables rule deleted for port ${configured_port} on ${VPN_CT_NAME} container"
+                echo "$(timestamp) | IPTables rule deleted for port ${configured_port} on QBIT container"
             fi
             echo "$(timestamp) | Port Changed to: $(findconfiguredport ${qbt_sid})"
         else
@@ -136,46 +109,10 @@ get_portmap() {
     fi
 
     if fw_addrule; then
-        echo "$(timestamp) | IPTables rule added for port ${active_port} on ${VPN_CT_NAME} container"
+        echo "$(timestamp) | IPTables rule added for port ${active_port} on Qbitcontainer container"
     fi
 
     return $res
-}
-
-check_vpn_ct_health() {
-    while true;
-    do
-        if ! docker inspect "${VPN_CT_NAME}" --format='{{json .State.Health.Status}}' | grep -q '"healthy"'; then
-            echo "$(timestamp) | Waiting for ${VPN_CT_NAME} healthy state.."
-            sleep 3
-        else
-            echo "$(timestamp) | VPN container ${VPN_CT_NAME} in healthy state!"
-            break
-        fi
-    done
-}
-
-pre_reqs() {
-    if [ -z "${VPN_GATEWAY}" ]; then
-        VPN_GATEWAY=$(get_vpn_if_gw || echo '')
-    fi
-while read -r var; do
-    [ -z "${!var}" ] && { echo "$(timestamp) | ${var} is empty or not set."; exit 1; }
-done << EOF
-QBITTORRENT_SERVER
-QBITTORRENT_PORT
-QBITTORRENT_USER
-QBITTORRENT_PASS
-VPN_GATEWAY
-VPN_CT_NAME
-VPN_IF_NAME
-CHECK_INTERVAL
-NAT_LEASE_LIFETIME
-EOF
-
-[ ! -S /var/run/docker.sock ] && { echo "$(timestamp) | Docker socket doesn't exist or is inaccessible"; exit 2; }
-
-return 0
 }
 
 load_vals(){
@@ -199,17 +136,6 @@ configured_port=
 active_port=
 qbt_sid=
 
-# Wait for a healthy state on the VPN container
-check_vpn_ct_health
-
-if pre_reqs; then load_vals; fi
-
-# shellcheck disable=SC2086
-[ -z ${public_ip} ] && { echo "$(timestamp) | Unable to grab VPN Public IP. Please check configuration"; exit 3; }
-# shellcheck disable=SC2086
-[ -z ${configured_port} ] && { echo "$(timestamp) | qBittorrent configured port value is empty(?). Please check configuration"; exit 4; }
-[ -z "${qbt_sid}" ] && { echo "$(timestamp) | Unable to grab qBittorrent SessionID. Please check configuration"; exit 5; }
-
 while true;
 do
     if get_portmap; then
@@ -220,7 +146,7 @@ do
     # shellcheck disable=SC2086
     echo "$(timestamp) | Sleeping for $(echo ${CHECK_INTERVAL}/60 | bc) minutes"
     # shellcheck disable=SC2086
-    sleep ${CHECK_INTERVAL}
+    sleep 50
 done
 
 exit $?
